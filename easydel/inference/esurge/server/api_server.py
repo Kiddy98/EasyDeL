@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import traceback
 import typing as tp
@@ -49,6 +50,7 @@ from ...sampling_params import SamplingParams
 from ...tools.tool_calling_mixin import ToolCallingMixin
 from ..esurge_engine import RequestOutput, eSurge
 
+STREAM_GENERATE_FLAG_PATH = os.environ.get("STREAM_GENERATE_FLAG_PATH", "/dev/shm/stream_generate_flag")
 TIMEOUT_KEEP_ALIVE = 5.0
 logger = get_logger("eSurgeApiServer")
 
@@ -343,6 +345,10 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             >>> # Returns " world" (extracted from accumulation)
         """
         current_text = current_text or ""
+
+        # Write flag
+        with open(STREAM_GENERATE_FLAG_PATH, "w", encoding="utf-8") as f:
+            f.write("1")
 
         # Case 1: Normal incremental streaming - extract new suffix
         if current_text.startswith(previous_text):
