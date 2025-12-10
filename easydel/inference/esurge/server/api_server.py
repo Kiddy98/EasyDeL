@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import traceback
 import typing as tp
@@ -58,6 +59,9 @@ from ...sampling_params import SamplingParams
 from ...tools.tool_calling_mixin import ToolCallingMixin
 from ..esurge_engine import RequestOutput, eSurge
 from .auth_endpoints import AuthEndpointsMixin
+
+STREAM_GENERATE_FLAG_PATH = os.environ.get("STREAM_GENERATE_FLAG_PATH", "/dev/shm/stream_generate_flag")
+STREAM_GENERATE_IGNORE_FLAG = os.environ.get("STREAM_GENERATE_IGNORE_FLAG", "2")
 
 TIMEOUT_KEEP_ALIVE = 5.0
 logger = get_logger("eSurgeApiServer")
@@ -1088,6 +1092,11 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
                         current_text = output.accumulated_text or ""
                         delta_text = output.delta_text
+
+                        if delta_text and not delta_text.endswith(STREAM_GENERATE_IGNORE_FLAG):
+                            # Write flag
+                            with open(STREAM_GENERATE_FLAG_PATH, "w", encoding="utf-8") as f:
+                                f.write("1")
 
                         if tool_parser:
                             current_token_ids = output.outputs[0].token_ids if output.outputs else []
