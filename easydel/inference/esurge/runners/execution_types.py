@@ -83,6 +83,7 @@ class BatchMetadata:
     top_k: jax.Array
     min_p: jax.Array
     positions: jax.Array
+    num_computed_tokens: jax.Array
 
     # v2-specific fields (optional, only populated when version="v2")
     slot_mapping: jax.Array | None = None
@@ -154,9 +155,6 @@ class StepFunctionInputs:
         lines = []
 
         lines.append("StepFunctionInputs Status")
-        lines.append("\nMinimalDeviceState:")
-        lines.append(f"  token_ids:       {self.device_state.token_ids.shape}")
-        lines.append(f"  num_tokens:      {self.device_state.num_tokens.shape}")
         lines.append("\nRaggedPagesCache:")
         lines.append(f"  kv_pages:        {len(self.kv_pages.views)}x{self.kv_pages.views[-1].kv_pages.shape}")
         lines.append("\nRequest Arrays:")
@@ -180,6 +178,7 @@ class StepFunctionInputs:
         lines.append(f"  top_k:                {self.batch_metadata.top_k.shape}")
         lines.append(f"  min_p:                {self.batch_metadata.min_p.shape}")
         lines.append(f"  positions:            {self.batch_metadata.positions.shape}")
+        lines.append(f"  num_computed_tokens:  {self.batch_metadata.num_computed_tokens.shape}")
         if self.batch_metadata.slot_mapping is not None:
             lines.append(f"  slot_mapping:         {self.batch_metadata.slot_mapping.shape}")
         if self.batch_metadata.num_kv_update_slices is not None:

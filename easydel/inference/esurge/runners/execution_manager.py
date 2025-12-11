@@ -93,7 +93,7 @@ from easydel.utils import ejit
 from ..core.sampler import sample_tokens
 from ..core.sampling_metadata import SamplingMetadata
 from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
-from .execution_types import BatchMetadata, MinimalDeviceState, ModelStepOutputs, StepFunctionInputs
+from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
 from .sequence_buffer import SequenceBuffer
 
 DEBUG_MODE = False
@@ -456,7 +456,6 @@ class ExecutionManager:
         pixel_values_videos: numpy.ndarray | None = None,
         video_grid_thw: numpy.ndarray | None = None,
     ) -> tuple[
-        MinimalDeviceState,
         jax.Array,
         jax.Array,
         jax.Array,
@@ -465,7 +464,7 @@ class ExecutionManager:
         jax.Array,
         jax.Array,
         jax.Array,
-        jax.Array,
+        dict[str, float],
     ]:
         """Execute a single fused inference step.
 
@@ -492,7 +491,6 @@ class ExecutionManager:
 
         Returns:
             Tuple of 10 elements:
-                - device_state: Updated sequence state with new tokens written.
                 - out_tokens_full: Generated tokens [max_num_reqs], -1 for invalid.
                 - valid_mask_full: Boolean mask for valid generations [max_num_reqs].
                 - input_ids_buf: Updated input buffer (may contain new tokens).
@@ -502,6 +500,7 @@ class ExecutionManager:
                 - pages_tables_buf: Page tables [num_reqs, max_pages].
                 - hidden_states: Last layer hidden states [num_tokens, hidden_dim].
                 - logits: Output logits [padded_num_reqs, vocab_size].
+                - metrics: Timing metrics for prep/exec/sample.
 
         Raises:
             KeyError: If no compiled function exists for (num_tokens, padded_num_reqs).
@@ -530,8 +529,6 @@ class ExecutionManager:
             batch_metadata,
             input_ids_buf,
             position_ids_buf,
-            token_ids_dev,
-            num_computed_tokens_dev,
             scheduled_full,
             active_mask_full,
         ) = self.prepare_batch_metadata(
@@ -555,9 +552,6 @@ class ExecutionManager:
             video_grid_thw=video_grid_thw,
         )
 
-        # Create minimal device state from already-transferred arrays (no separate device transfer needed)
-        device_state = MinimalDeviceState(token_ids=token_ids_dev, num_tokens=num_computed_tokens_dev)
-
         inputs = StepFunctionInputs(
             kv_pages=self.kv_pages,
             scheduled_full=scheduled_full,
@@ -576,14 +570,9 @@ class ExecutionManager:
             _tree_hash_diff(model_hash_baseline, model_hash)
 
         start_exec = time.time()
-        model_outputs = jax.block_until_ready(model_fn(self.graphstate, self.graphother, inputs))
-        exec_took = time.time() - start_exec
-
-        self.kv_pages = model_outputs.kv_pages
-
+        model_outputs = model_fn(self.graphstate, self.graphother, inputs)
         sampler_inputs = (
             batch_metadata,
-            device_state,
             req_num_tokens_full,
             active_mask_full,
             model_outputs.logits,
@@ -596,8 +585,16 @@ class ExecutionManager:
             _tree_hash_diff(sampler_hash_baseline, sampler_hash)
 
         start_sample = time.time()
-        device_state, self.rng_key, out_tokens_full, valid_mask_full = jax.block_until_ready(sampler_fn(*sampler_inputs))
-        sample_took = time.time() - start_sample
+        self.rng_key, out_tokens_full, valid_mask_full = sampler_fn(*sampler_inputs)
+        # Single sync to cover model + sampler
+        self.rng_key, out_tokens_full, valid_mask_full, model_outputs = jax.block_until_ready(
+            (self.rng_key, out_tokens_full, valid_mask_full, model_outputs)
+        )
+        total_exec = time.time() - start_exec
+        exec_took = total_exec
+        sample_took = 0.0
+
+        self.kv_pages = model_outputs.kv_pages
         buckets_processed = batch_metadata.input_ids_buf.shape[-1]
         metrics = {
             "exec_time": exec_took,
@@ -613,7 +610,6 @@ class ExecutionManager:
         logits = model_outputs.logits
 
         return (
-            device_state,
             out_tokens_full,
             valid_mask_full,
             input_ids_buf,
@@ -728,9 +724,9 @@ class ExecutionManager:
             metadata,
         )
         # compargs already contains properly prepared metadata from get_compile_configurations
-        inputs, device_state = compargs[3], compargs[4]
+        inputs = compargs[3]
         self._compile_model_step(num_tokens, padded_num_reqs, compargs)
-        self._compile_sampler(num_tokens, padded_num_reqs, inputs, inputs.batch_metadata, device_state)
+        self._compile_sampler(num_tokens, padded_num_reqs, inputs, inputs.batch_metadata)
 
     def init_fns(self) -> None:
         """Initialize the fused step execution function.
@@ -859,7 +855,6 @@ class ExecutionManager:
 
         Args:
             num_tokens_static: Number of tokens to process
-            device_state: Device sequence state (for page tables and sampling params)
             scheduled_full: Tokens scheduled per request
             active_mask_full: Active request mask
             input_ids_buf: Input buffer (will be replaced)
@@ -869,7 +864,7 @@ class ExecutionManager:
             padded_num_reqs_in: Caller-selected padded request bucket
 
         Returns:
-            Tuple of (BatchMetadata, input_ids_buf, position_ids_buf)
+            Tuple of (BatchMetadata, input_ids_buf, position_ids_buf, scheduled_full_dev, active_mask_full_dev)
         """
         max_num_reqs = int(self.max_num_reqs)
         num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
@@ -895,13 +890,19 @@ class ExecutionManager:
 
         # Get batched arange: [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         arange = numpy.concatenate([self._arange_cpu[:n] for n in scheduled[:num_requests]])
+        decode_flags = ((scheduled[:num_requests] == 1) & (num_computed_tokens_cpu[:num_requests] > 0)).astype(
+            numpy.int32
+        )
+        decode_flags_rep = decode_flags[req_indices]
 
         # Actual number of tokens being processed (may be less than padded num_tokens_static)
         actual_num_tokens = len(req_indices)
 
         # Compute positions on CPU (use actual size for computation)
         positions_np = self._positions_cpu[:actual_num_tokens]
-        numpy.add(num_computed_tokens_cpu[req_indices], arange, out=positions_np)
+        base_positions = num_computed_tokens_cpu[req_indices] - decode_flags_rep
+        numpy.add(base_positions, arange, out=positions_np)
+        numpy.clip(positions_np, 0, None, out=positions_np)
 
         # Token gathering on CPU
         token_indices = positions_np + req_indices * token_ids_cpu.shape[1]  # max_model_len
@@ -952,8 +953,7 @@ class ExecutionManager:
 
         # Transfer all CPU-computed arrays to device in ONE operation to minimize overhead
         # Slice logits_indices to padded_num_reqs for efficient sampling
-        # Also include token_ids, num_computed_tokens, scheduled_full, active_mask_full
-        # to avoid separate device transfers in execute()
+        # Keep transfer payload minimal: no full token buffer copies
         host_payload = (
             self._input_ids_cpu[:num_tokens_static],
             self._positions_cpu[:num_tokens_static],
@@ -971,8 +971,6 @@ class ExecutionManager:
             request_distribution if request_distribution is not None else self._request_distribution_placeholder,
             slot_mapping_cpu if slot_mapping_cpu is not None else self._slot_mapping_placeholder,
             num_kv_update_cpu if num_kv_update_cpu is not None else self._num_kv_update_placeholder,
-            # Additional arrays to consolidate device transfers (previously separate in execute())
-            token_ids_cpu,
             num_computed_tokens_cpu,
             scheduled_full_cpu,
             active_mask_full_cpu,
@@ -994,8 +992,6 @@ class ExecutionManager:
             req_dist_dev,
             slot_mapping_dev,
             num_kv_update_dev,
-            # Additional arrays (consolidated from execute())
-            token_ids_dev,
             num_computed_tokens_dev,
             scheduled_full_dev,
             active_mask_full_dev,
@@ -1030,6 +1026,7 @@ class ExecutionManager:
             top_k=top_k_dev,
             min_p=min_p_dev,
             positions=position_ids_buf,
+            num_computed_tokens=num_computed_tokens_dev,
             request_distribution=req_dist_dev if self._use_request_distribution else None,
             slot_mapping=slot_mapping_dev if self._use_slot_mapping else None,
             num_kv_update_slices=num_kv_update_dev if self._use_slot_mapping else None,
@@ -1044,8 +1041,6 @@ class ExecutionManager:
             metadata,
             input_ids_buf,
             position_ids_buf,
-            token_ids_dev,
-            num_computed_tokens_dev,
             scheduled_full_dev,
             active_mask_full_dev,
         )
@@ -1057,7 +1052,6 @@ class ExecutionManager:
         active_mask_full_cpu: numpy.ndarray,
         input_ids_buf: jax.Array,
         position_ids_buf: jax.Array,
-        token_ids_cpu: numpy.ndarray,
         num_computed_tokens_cpu: numpy.ndarray,
         temperature_cpu: numpy.ndarray,
         top_p_cpu: numpy.ndarray,
@@ -1093,10 +1087,16 @@ class ExecutionManager:
 
         req_indices = numpy.repeat(numpy.arange(num_requests, dtype=numpy.int32), scheduled[:num_requests])
         arange = numpy.concatenate([self._arange_cpu[:n] for n in scheduled[:num_requests]])
+        decode_flags = ((scheduled[:num_requests] == 1) & (num_computed_tokens_cpu[:num_requests] > 0)).astype(
+            numpy.int32
+        )
+        decode_flags_rep = decode_flags[req_indices]
         actual_num_tokens = len(req_indices)
 
         positions_np = self._positions_cpu[:actual_num_tokens]
-        numpy.add(num_computed_tokens_cpu[req_indices], arange, out=positions_np)
+        base_positions = num_computed_tokens_cpu[req_indices] - decode_flags_rep
+        numpy.add(base_positions, arange, out=positions_np)
+        numpy.clip(positions_np, 0, None, out=positions_np)
 
         token_indices = positions_np + req_indices * token_ids_cpu.shape[1]
         numpy.take(token_ids_cpu.ravel(), token_indices, out=self._input_ids_cpu[:actual_num_tokens])
@@ -1155,7 +1155,6 @@ class ExecutionManager:
             request_distribution if request_distribution is not None else self._request_distribution_placeholder,
             slot_mapping_cpu if slot_mapping_cpu is not None else self._slot_mapping_placeholder,
             num_kv_update_cpu if num_kv_update_cpu is not None else self._num_kv_update_placeholder,
-            token_ids_cpu.copy(),
             num_computed_tokens_cpu.copy(),
             scheduled_full_cpu.copy(),
             active_mask_full_cpu.copy(),
@@ -1170,7 +1169,7 @@ class ExecutionManager:
 
     def get_async_prep_result(
         self,
-    ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array] | None:
+    ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array] | None:
         """Get the result of a previously started async prep.
 
         Returns None if no async prep is pending. Otherwise waits for the
@@ -1197,7 +1196,6 @@ class ExecutionManager:
             req_dist_dev,
             slot_mapping_dev,
             num_kv_update_dev,
-            token_ids_dev,
             num_computed_tokens_dev,
             scheduled_full_dev,
             active_mask_full_dev,
@@ -1218,6 +1216,7 @@ class ExecutionManager:
             top_k=top_k_dev,
             min_p=min_p_dev,
             positions=position_ids_buf,
+            num_computed_tokens=num_computed_tokens_dev,
             request_distribution=req_dist_dev if self._use_request_distribution else None,
             slot_mapping=slot_mapping_dev if self._use_slot_mapping else None,
             num_kv_update_slices=num_kv_update_dev if self._use_slot_mapping else None,
@@ -1232,8 +1231,6 @@ class ExecutionManager:
             metadata,
             input_ids_buf,
             position_ids_buf,
-            token_ids_dev,
-            num_computed_tokens_dev,
             scheduled_full_dev,
             active_mask_full_dev,
         ), transfer_meta
@@ -1250,7 +1247,7 @@ class ExecutionManager:
             seq_lens=self._empty_sharding,
             pages_tables=self._empty_sharding,
             padded_num_reqs=self._empty_sharding,
-            request_distribution=self._empty_sharding,
+            request_distribution=self._empty_sharding if self._use_request_distribution else None,
             logits_indices=self._empty_sharding,
             input_ids_buf=self._empty_sharding,
             position_ids_buf=self._empty_sharding,
@@ -1260,6 +1257,7 @@ class ExecutionManager:
             top_k=self._empty_sharding,
             min_p=self._empty_sharding,
             positions=self._empty_sharding,
+            num_computed_tokens=self._empty_sharding,
             # v2-specific shardings (None if not used)
             slot_mapping=self._empty_sharding if self._use_slot_mapping else None,
             num_kv_update_slices=self._empty_sharding if self._use_slot_mapping else None,
@@ -1360,13 +1358,10 @@ class ExecutionManager:
     def get_sampling_fn(self) -> typing.Callable:
         """Create the sampler/update ejit executed after model forward."""
 
-        max_model_len = self.max_model_len
-
         @ejit
         @self.maybe_implicit
         def _sampling_fn(
             metadata: BatchMetadata,
-            device_state: MinimalDeviceState,
             req_num_tokens_full: jax.Array,
             active_mask_full: jax.Array,
             logits: jax.Array,
@@ -1396,33 +1391,20 @@ class ExecutionManager:
                 linear_penalty=None,
             )
 
-            sampled_flat = sample_tokens(logits, sampling_metadata, metadata.positions, rng_key)
+            # Use per-request positions to seed sampling
+            sampled_flat = sample_tokens(logits, sampling_metadata, metadata.num_computed_tokens, rng_key)
             total_tokens = metadata.query_start_loc[-1]
             rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
 
-            # num_tokens in MinimalDeviceState represents num_computed_tokens
-            # Slice state arrays to match batch_size
-            num_tokens_slice = device_state.num_tokens[:batch_size]
             scheduled_slice = metadata.scheduled[:batch_size]
-            seq_lens_now = num_tokens_slice + scheduled_slice
+            seq_lens_now = metadata.num_computed_tokens[:batch_size] + scheduled_slice
             req_num_tokens_slice = req_num_tokens_full[:batch_size]
             active_mask_slice = active_mask_full[:batch_size]
             meets_len = seq_lens_now >= req_num_tokens_slice
             valid_mask = (i_reqs < metadata.num_requests) & active_mask_slice & (scheduled_slice > 0) & meets_len
 
-            j_pos = jnp.clip(seq_lens_now, 0, max_model_len - 1)
-            curr_vals = device_state.token_ids[i_reqs, j_pos]
-            delta = jnp.where(valid_mask, sampled_flat - curr_vals, 0)
-
-            token_ids = device_state.token_ids.at[(i_reqs, j_pos)].add(delta)
-            num_tokens = device_state.num_tokens.at[:batch_size].add(valid_mask.astype(device_state.num_tokens.dtype))
-
-            # MinimalDeviceState is a frozen pytree, use replace to create updated version
-            from dataclasses import replace
-
-            new_state = replace(device_state, token_ids=token_ids, num_tokens=num_tokens)
             out_tokens = jnp.where(valid_mask, sampled_flat, -1)
-            return new_state, rng_key, out_tokens, valid_mask
+            return rng_key, out_tokens, valid_mask
 
         return _sampling_fn
 
@@ -1452,7 +1434,6 @@ class ExecutionManager:
         padded_num_reqs: int,
         inputs: StepFunctionInputs,
         metadata: BatchMetadata,
-        device_state: MinimalDeviceState,
     ):
         """Compile the sampler/update ejit."""
         mode = "aot" if self.use_aot_forward else "jit"
@@ -1470,7 +1451,6 @@ class ExecutionManager:
 
         sampler_args = (
             metadata,
-            device_state,
             inputs.req_num_tokens_full,
             inputs.active_mask_full,
             dummy_logits,
@@ -1572,8 +1552,6 @@ class ExecutionManager:
             dummy_metadata,
             input_ids_buf,
             position_ids_buf,
-            token_ids_dev,
-            num_computed_tokens_dev,
             scheduled_full,
             active_mask_full,
         ) = self.prepare_batch_metadata(
@@ -1592,9 +1570,6 @@ class ExecutionManager:
             padded_num_reqs_in=padded_num_reqs,
         )
 
-        # device_state for compilation uses already-transferred arrays
-        device_state = MinimalDeviceState(token_ids=token_ids_dev, num_tokens=num_computed_tokens_dev)
-
         inputs = StepFunctionInputs(
             kv_pages=kv_pages,
             scheduled_full=scheduled_full,
@@ -1604,7 +1579,7 @@ class ExecutionManager:
             batch_metadata=dummy_metadata,
         )
 
-        return [self.graphdef, self.graphstate, self.graphother, inputs, device_state]
+        return [self.graphdef, self.graphstate, self.graphother, inputs]
 
     @property
     def maybe_implicit(self):
