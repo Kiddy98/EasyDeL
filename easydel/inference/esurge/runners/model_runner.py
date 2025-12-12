@@ -294,7 +294,11 @@ class eSurgeRunner:
         if user_buckets:
             buckets = sorted({int(b) for b in user_buckets if 0 < int(b) <= max_num_seqs})
         else:
-            buckets = self._get_request_paddings(min_input_pad, max_num_seqs)
+            # Request-count buckets should be based on the number of active requests,
+            # not token padding (min_input_pad). Using min_input_pad here collapses
+            # buckets to max_num_seqs for common defaults (e.g., 256 vs 16) and
+            # forces padded_num_reqs to max_num_seqs even for small batches.
+            buckets = self._get_request_paddings(1, max_num_seqs)
         if not buckets or buckets[-1] != max_num_seqs:
             buckets.append(max_num_seqs)
         return buckets

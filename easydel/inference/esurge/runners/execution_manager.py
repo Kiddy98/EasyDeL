@@ -919,12 +919,11 @@ class ExecutionManager:
         # Logits indices on CPU
         self._logits_indices_cpu[:num_requests] = self._query_start_loc_cpu[1 : num_requests + 1] - 1
 
-        # Compute padded_num_reqs on CPU, honoring caller-selected bucket
+        # Compute padded_num_reqs on CPU, honoring caller-selected bucket.
+        # Note: min_input_pad is token-padding and must not be used here, otherwise
+        # small batches get forced to max_num_reqs for common defaults.
         nr_safe = max(num_requests, 1)
-        requested_bucket = max(int(padded_num_reqs_in), nr_safe)
-        next_pow2 = 1 << (nr_safe - 1).bit_length()
-        fallback_bucket = self.min_input_pad if nr_safe <= self.min_input_pad else next_pow2
-        padded_num_reqs = min(max(requested_bucket, fallback_bucket), max_num_reqs)
+        padded_num_reqs = min(max(int(padded_num_reqs_in), nr_safe), max_num_reqs)
 
         # Page table already on CPU
         pt_src = page_table_cpu[: min(page_table_cpu.shape[0], num_reqs_max_model_len), :]
@@ -1110,10 +1109,7 @@ class ExecutionManager:
         self._logits_indices_cpu[:num_requests] = self._query_start_loc_cpu[1 : num_requests + 1] - 1
 
         nr_safe = max(num_requests, 1)
-        requested_bucket = max(int(padded_num_reqs_in), nr_safe)
-        next_pow2 = 1 << (nr_safe - 1).bit_length()
-        fallback_bucket = self.min_input_pad if nr_safe <= self.min_input_pad else next_pow2
-        padded_num_reqs = min(max(requested_bucket, fallback_bucket), max_num_reqs)
+        padded_num_reqs = min(max(int(padded_num_reqs_in), nr_safe), max_num_reqs)
 
         pt_src = page_table_cpu[: min(page_table_cpu.shape[0], num_reqs_max_model_len), :]
         mask_rows = numpy.arange(num_reqs_max_model_len) < min(num_requests, num_reqs_max_model_len)
