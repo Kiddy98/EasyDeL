@@ -12,15 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Async scheduling types for overlapping token sampling with forward pass.
-
-This module provides data structures for async scheduling, which allows
-token sampling to overlap with the next iteration's forward pass.
-"""
+"""Async scheduling types for overlapping token sampling with forward pass."""
 
 from dataclasses import dataclass
-
-from jax import Array
+from typing import Any
 
 from .states import CachedRequestState
 
@@ -35,7 +30,7 @@ class AsyncPreResults:
 
     Attributes:
         req_ids: List of request IDs from the previous iteration.
-        next_tokens: JAX array of sampled tokens (on device, async copy to host).
+        next_tokens: Sampled tokens (host array).
         request_seq_lens: List of (req_idx, req_state, seq_len) tuples for
             requests that generated tokens.
         discard_sampled_tokens_req_indices: Indices of requests whose tokens
@@ -57,7 +52,7 @@ class AsyncPreResults:
     """
 
     req_ids: list[str]
-    next_tokens: Array
+    next_tokens: Any
     request_seq_lens: list[tuple[int, CachedRequestState, int]]
     discard_sampled_tokens_req_indices: list[int]
     placeholder_req_id_to_index: dict[str, int]

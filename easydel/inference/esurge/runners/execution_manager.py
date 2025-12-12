@@ -475,8 +475,6 @@ class ExecutionManager:
         Args:
             num_tokens: Total tokens to process across all requests in this step.
                 Must match a value from num_tokens_paddings used during compile().
-            device_state: Current device-side sequence state (DeviceSequenceState).
-                Contains token buffers, position tracking, and sampling parameters.
             scheduled_full: Number of tokens scheduled per request [max_num_reqs].
                 Determines how many tokens from each request enter this step.
             req_num_tokens_full: Target token count per request [max_num_reqs].
@@ -492,7 +490,6 @@ class ExecutionManager:
 
         Returns:
             Tuple of 10 elements:
-                - device_state: Updated sequence state with new tokens written.
                 - out_tokens_full: Generated tokens [max_num_reqs], -1 for invalid.
                 - valid_mask_full: Boolean mask for valid generations [max_num_reqs].
                 - input_ids_buf: Updated input buffer (may contain new tokens).
@@ -555,7 +552,6 @@ class ExecutionManager:
             video_grid_thw=video_grid_thw,
         )
 
-        # Create minimal device state from already-transferred arrays (no separate device transfer needed)
         device_state = MinimalDeviceState(token_ids=token_ids_dev, num_tokens=num_computed_tokens_dev)
 
         inputs = StepFunctionInputs(
@@ -613,7 +609,6 @@ class ExecutionManager:
         logits = model_outputs.logits
 
         return (
-            device_state,
             out_tokens_full,
             valid_mask_full,
             input_ids_buf,
@@ -624,6 +619,7 @@ class ExecutionManager:
             hidden_states,
             logits,
             metrics,
+            device_state,
         )
 
     def compile(
@@ -859,7 +855,6 @@ class ExecutionManager:
 
         Args:
             num_tokens_static: Number of tokens to process
-            device_state: Device sequence state (for page tables and sampling params)
             scheduled_full: Tokens scheduled per request
             active_mask_full: Active request mask
             input_ids_buf: Input buffer (will be replaced)
@@ -952,7 +947,7 @@ class ExecutionManager:
 
         # Transfer all CPU-computed arrays to device in ONE operation to minimize overhead
         # Slice logits_indices to padded_num_reqs for efficient sampling
-        # Also include token_ids, num_computed_tokens, scheduled_full, active_mask_full
+        # Also include num_computed_tokens, scheduled_full, active_mask_full
         # to avoid separate device transfers in execute()
         host_payload = (
             self._input_ids_cpu[:num_tokens_static],
@@ -971,7 +966,6 @@ class ExecutionManager:
             request_distribution if request_distribution is not None else self._request_distribution_placeholder,
             slot_mapping_cpu if slot_mapping_cpu is not None else self._slot_mapping_placeholder,
             num_kv_update_cpu if num_kv_update_cpu is not None else self._num_kv_update_placeholder,
-            # Additional arrays to consolidate device transfers (previously separate in execute())
             token_ids_cpu,
             num_computed_tokens_cpu,
             scheduled_full_cpu,
@@ -994,7 +988,6 @@ class ExecutionManager:
             req_dist_dev,
             slot_mapping_dev,
             num_kv_update_dev,
-            # Additional arrays (consolidated from execute())
             token_ids_dev,
             num_computed_tokens_dev,
             scheduled_full_dev,
@@ -1401,7 +1394,6 @@ class ExecutionManager:
             rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
 
             # num_tokens in MinimalDeviceState represents num_computed_tokens
-            # Slice state arrays to match batch_size
             num_tokens_slice = device_state.num_tokens[:batch_size]
             scheduled_slice = metadata.scheduled[:batch_size]
             seq_lens_now = num_tokens_slice + scheduled_slice
@@ -1410,18 +1402,16 @@ class ExecutionManager:
             meets_len = seq_lens_now >= req_num_tokens_slice
             valid_mask = (i_reqs < metadata.num_requests) & active_mask_slice & (scheduled_slice > 0) & meets_len
 
-            j_pos = jnp.clip(seq_lens_now, 0, max_model_len - 1)
-            curr_vals = device_state.token_ids[i_reqs, j_pos]
+            out_tokens = jnp.where(valid_mask, sampled_flat, -1)
+            token_ids = device_state.token_ids
+            curr_vals = token_ids[i_reqs, jnp.clip(seq_lens_now, 0, max_model_len - 1)]
             delta = jnp.where(valid_mask, sampled_flat - curr_vals, 0)
-
-            token_ids = device_state.token_ids.at[(i_reqs, j_pos)].add(delta)
+            token_ids = token_ids.at[(i_reqs, jnp.clip(seq_lens_now, 0, max_model_len - 1))].add(delta)
             num_tokens = device_state.num_tokens.at[:batch_size].add(valid_mask.astype(device_state.num_tokens.dtype))
 
-            # MinimalDeviceState is a frozen pytree, use replace to create updated version
             from dataclasses import replace
 
             new_state = replace(device_state, token_ids=token_ids, num_tokens=num_tokens)
-            out_tokens = jnp.where(valid_mask, sampled_flat, -1)
             return new_state, rng_key, out_tokens, valid_mask
 
         return _sampling_fn
@@ -1592,9 +1582,6 @@ class ExecutionManager:
             padded_num_reqs_in=padded_num_reqs,
         )
 
-        # device_state for compilation uses already-transferred arrays
-        device_state = MinimalDeviceState(token_ids=token_ids_dev, num_tokens=num_computed_tokens_dev)
-
         inputs = StepFunctionInputs(
             kv_pages=kv_pages,
             scheduled_full=scheduled_full,
@@ -1604,6 +1591,7 @@ class ExecutionManager:
             batch_metadata=dummy_metadata,
         )
 
+        device_state = MinimalDeviceState(token_ids=token_ids_dev, num_tokens=num_computed_tokens_dev)
         return [self.graphdef, self.graphstate, self.graphother, inputs, device_state]
 
     @property

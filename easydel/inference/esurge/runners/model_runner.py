@@ -686,8 +686,8 @@ class eSurgeRunner:
         pre_request_seq_lens = self._pre_async_results.request_seq_lens
         pre_discard_indices = self._pre_async_results.discard_sampled_tokens_req_indices
 
-        # Block until tokens are ready (async copy to host completes)
-        next_tokens_cpu = np.asarray(jax.device_get(pre_next_tokens))
+        # Tokens already stored on host from previous iteration
+        next_tokens_cpu = np.asarray(pre_next_tokens)
         selected_token_ids = np.expand_dims(next_tokens_cpu[: len(pre_req_ids)], 1)
 
         # Mask out discarded tokens
@@ -717,6 +717,11 @@ class eSurgeRunner:
             self.sequence_buffer.token_ids[req_idx, start_idx:end_idx] = sampled_ids
             # Replace placeholder in output_token_ids
             req_state.output_token_ids[-1] = int(sampled_ids[-1])
+            new_len = int(self.sequence_buffer.num_tokens_no_spec[req_idx])
+            self.sequence_buffer.num_computed_tokens[req_idx] = new_len
+            self.sequence_buffer.num_tokens_no_spec[req_idx] = max(self.sequence_buffer.num_tokens_no_spec[req_idx], new_len)
+            self.sequence_buffer.num_tokens[req_idx] = max(self.sequence_buffer.num_tokens[req_idx], new_len)
+            req_state.num_computed_tokens = new_len
 
     def _update_placeholder(
         self,
@@ -761,6 +766,8 @@ class eSurgeRunner:
             # Update buffer state
             self.sequence_buffer.num_tokens_no_spec[req_idx] = end_idx
             self.sequence_buffer.num_tokens[req_idx] = end_idx
+            self.sequence_buffer.num_computed_tokens[req_idx] = end_idx
+            req_state.num_computed_tokens = end_idx
 
             # Add placeholder (0) to output
             req_state.output_token_ids.extend([0])
@@ -952,7 +959,6 @@ class eSurgeRunner:
             page_table_cpu = self.sequence_buffer.page_table[0].get_cpu_tensor()
             step_start = time.time()
             (
-                minimal_device_state,
                 out_tokens_win,
                 valid_mask_win,
                 self.input_ids_buf,
@@ -963,6 +969,7 @@ class eSurgeRunner:
                 _hidden_states,
                 _logits,
                 metrics,
+                _device_state,
             ) = self.executor_manager.execute(
                 num_tokens=num_tokens_static,
                 scheduled_full_cpu=scheduled_full_cpu,
@@ -987,10 +994,6 @@ class eSurgeRunner:
             # Clear vision data after prefill to free memory
             for req_state in vision_request_states:
                 req_state.clear_vision_data()
-
-            # Start async copy to host (non-blocking) - overlaps with post-processing
-            token_ids_async = jax.copy_to_host_async(minimal_device_state.token_ids)
-            num_tokens_async = jax.copy_to_host_async(minimal_device_state.num_tokens)
 
             # account for device time (blocking already happened inside execute())
             total_step_time += time.time() - step_start
@@ -1039,21 +1042,28 @@ class eSurgeRunner:
                     sampled_token_ids_all.append([])
                     discard_sampled_tokens_req_indices.append(i)
 
+            if not scheduler_output.async_scheduling:
+                # Update host-side buffers directly to avoid full token buffer D2H copies.
+                for i, rid in enumerate(req_ids_window):
+                    if rid is None or not valid_np[i]:
+                        continue
+                    req_idx = self.sequence_buffer.req_id_to_index.get(rid)
+                    if req_idx is None:
+                        continue
+                    req_state = self.requests.get(rid)
+                    curr_len = int(self.sequence_buffer.num_computed_tokens[req_idx])
+                    if curr_len >= self.max_model_len:
+                        continue
+                    self.sequence_buffer.token_ids[req_idx, curr_len] = int(tokens_np[i])
+                    new_len = curr_len + 1
+                    self.sequence_buffer.num_computed_tokens[req_idx] = new_len
+                    self.sequence_buffer.num_tokens_no_spec[req_idx] = new_len
+                    self.sequence_buffer.num_tokens[req_idx] = max(self.sequence_buffer.num_tokens[req_idx], new_len)
+                    if req_state is not None:
+                        req_state.num_computed_tokens = new_len
+
             up_wtime_took = time.time() - up_wtime
             total_post_proc_time += up_wtime_took
-
-            # Complete async sync-back (should be done by now, overlapped with post-processing)
-            sq_utime = time.time()
-            token_ids_updated = np.asarray(token_ids_async)
-            num_tokens_updated = np.asarray(num_tokens_async)
-            if not token_ids_updated.flags.writeable:
-                token_ids_updated = token_ids_updated.copy()
-            if not num_tokens_updated.flags.writeable:
-                num_tokens_updated = num_tokens_updated.copy()
-            self.sequence_buffer.token_ids = token_ids_updated
-            self.sequence_buffer.num_computed_tokens = num_tokens_updated
-            sq_utime_took = time.time() - sq_utime
-            total_sync_time += sq_utime_took
 
             start_index = end_index
 
@@ -1090,14 +1100,10 @@ class eSurgeRunner:
                 request_seq_lens,
             )
 
-            # Async copy to host (non-blocking)
-            next_tokens_jax = jnp.array(tokens_np, dtype=jnp.int32)
-            next_tokens = jax.copy_to_host_async(next_tokens_jax)
-
             # Store async results for next iteration
             self._pre_async_results = AsyncPreResults(
                 req_ids=req_ids_all,
-                next_tokens=next_tokens,
+                next_tokens=np.array(tokens_np, dtype=np.int32),
                 request_seq_lens=request_seq_lens,
                 discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
                 placeholder_req_id_to_index=placeholder_req_id_to_index,

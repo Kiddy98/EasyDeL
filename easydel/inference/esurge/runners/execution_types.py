@@ -154,9 +154,6 @@ class StepFunctionInputs:
         lines = []
 
         lines.append("StepFunctionInputs Status")
-        lines.append("\nMinimalDeviceState:")
-        lines.append(f"  token_ids:       {self.device_state.token_ids.shape}")
-        lines.append(f"  num_tokens:      {self.device_state.num_tokens.shape}")
         lines.append("\nRaggedPagesCache:")
         lines.append(f"  kv_pages:        {len(self.kv_pages.views)}x{self.kv_pages.views[-1].kv_pages.shape}")
         lines.append("\nRequest Arrays:")
