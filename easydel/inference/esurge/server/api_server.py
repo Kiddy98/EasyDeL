@@ -1091,7 +1091,18 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         elapsed_time = output.processing_time
 
                         current_text = output.accumulated_text or ""
-                        delta_text = output.delta_text
+                        current_token_ids = output.outputs[0].token_ids if output.outputs else previous_token_ids
+                        delta_text = self._compute_delta_text(
+                            current_text=current_text,
+                            previous_text=previous_text,
+                            fallback_delta=output.delta_text or "",
+                        )
+
+                        # Skip emitting when nothing new arrived (e.g., final snapshot with stale delta)
+                        if not delta_text and current_text == previous_text:
+                            previous_text = current_text
+                            previous_token_ids = current_token_ids
+                            continue
 
                         if delta_text and not delta_text.endswith(STREAM_GENERATE_IGNORE_FLAG):
                             # Write flag
@@ -1099,7 +1110,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                                 f.write("1")
 
                         if tool_parser:
-                            current_token_ids = output.outputs[0].token_ids if output.outputs else []
                             delta_token_ids = (
                                 current_token_ids[len(previous_token_ids) :] if previous_token_ids else current_token_ids
                             )
