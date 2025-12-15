@@ -2124,6 +2124,10 @@ class eSurge:
                             if pipeline_result.delta_text:
                                 ro.delta_seq += 1
                                 text_changed = True
+                        else:
+                            # No new decodable tokens (e.g., finished on EOS); clear delta to avoid re-emitting stale chunk
+                            if sample_index == 0:
+                                ro.delta_text = ""
 
                         num_prompt_tokens = (
                             len(rd["prompt_token_ids"])
